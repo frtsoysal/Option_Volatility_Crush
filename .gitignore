@@ -1,0 +1,16 @@
+# Raw JSON option-chain cache (~6.3 GB). Regenerable via fetch_spy_1yr.py
+option_volatility_crush.ipynb/pilot_data/spy_chains/
+
+# Uncompressed SPY CSVs — we ship the .gz versions via LFS to save bandwidth.
+# pandas reads .gz directly: pd.read_csv("spy_chains.csv.gz")
+option_volatility_crush.ipynb/pilot_data/spy_chains.csv
+option_volatility_crush.ipynb/pilot_data/spy_vol_oi_ratio.csv
+option_volatility_crush.ipynb/pilot_data/spy_pc_ratio.csv
+
+# Misc
+*.log
+.env
+__pycache__/
+.DS_Store
+.ipynb_checkpoints/
+.claude/
