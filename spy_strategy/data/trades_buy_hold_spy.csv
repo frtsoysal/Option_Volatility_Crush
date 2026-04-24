@@ -1,0 +1,2 @@
+strategy,entry_date,exit_date,entry_strike,entry_expiration,contracts,entry_premium_ps,mid_premium_ps,exit_value_ps,gross_pnl,net_pnl,entry_commission,exit_commission,entry_call_src,entry_put_src,exit_call_src,exit_put_src,wide_spread_any,phase2_pnl_pct_5d
+buy_hold_spy,2024-07-01,2026-04-21,,,187,534.1009521484375,534.1009521484375,704.0800170898438,31825.26903531256,31825.26903531256,0.0,0.0,n/a,n/a,n/a,n/a,False,
