@@ -1,0 +1,4 @@
+model,threshold,val_auc_pr,val_auc_roc,val_mcc,val_brier,test_auc_pr,test_auc_roc,test_mcc,test_brier
+logreg,0.3,0.5686,0.5728,0.1787,0.2394,0.8571,0.8333,0.7559,0.1944
+lgbm,0.55,0.5779,0.565,0.1599,0.2412,0.7778,0.6667,0.0,0.244
+xgb,0.3,0.5669,0.5542,0.1787,0.2353,0.6667,0.5,0.0,0.2411

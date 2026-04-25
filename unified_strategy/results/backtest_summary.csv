@@ -1,0 +1,7 @@
+strategy,n_trades,win_rate,profit_factor,avg_pnl_pct,median_pnl_pct,total_return,cagr,sharpe,max_drawdown
+always_short,9,0.6667,1.0675,0.0012,0.01009,0.0167,0.1633,0.9878,-0.1285
+vrp_only,7,0.5714,0.4663,-0.01218,0.00696,-0.0736,-0.7353,-2.9383,-0.1285
+ml_logreg,0,,,,,,,,
+ml_lgbm,2,1.0,inf,0.04233,0.04233,0.0777,3.2141,0.0,0.0
+ml_xgb,0,,,,,,,,
+buy_hold_spy,1,,,,,0.0246,,3.1792,
