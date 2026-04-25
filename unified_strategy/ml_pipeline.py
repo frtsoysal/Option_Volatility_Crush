@@ -27,8 +27,21 @@ from typing import Iterable
 import joblib
 import numpy as np
 import pandas as pd
+from sklearn import set_config
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.impute import SimpleImputer
+
+# Keep DataFrames flowing through Pipeline steps so LightGBM/XGBoost see the
+# same column names at fit and predict time (silences the feature-names warning).
+set_config(transform_output="pandas")
+
+# FrozenEstimator was added in sklearn 1.6 to replace cv='prefit' in
+# CalibratedClassifierCV. Older sklearn falls back to cv='prefit'.
+try:
+    from sklearn.frozen import FrozenEstimator
+    _HAS_FROZEN = True
+except ImportError:
+    _HAS_FROZEN = False
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     average_precision_score,
@@ -203,7 +216,10 @@ def train_one(
     raw_val = pipe.predict_proba(X_val)[:, 1]
     raw_test = pipe.predict_proba(X_test)[:, 1]
 
-    cal = CalibratedClassifierCV(estimator=pipe, method="isotonic", cv="prefit")
+    if _HAS_FROZEN:
+        cal = CalibratedClassifierCV(FrozenEstimator(pipe), method="isotonic")
+    else:
+        cal = CalibratedClassifierCV(estimator=pipe, method="isotonic", cv="prefit")
     cal.fit(X_val, y_val)
     cal_val = cal.predict_proba(X_val)[:, 1]
     cal_test = cal.predict_proba(X_test)[:, 1]
