@@ -33,7 +33,7 @@ import requests
 
 HERE = Path(__file__).resolve().parent
 CACHE_ROOT = HERE / "pilot_data" / "spy_chains"
-DEFAULT_KEY = os.getenv("ALPHAVANTAGE_API_KEY", "OZHQZ0GJGJS3JEL2")
+DEFAULT_KEY = os.getenv("ALPHAVANTAGE_API_KEY", "")
 
 ENDPOINTS = {
     "chains": {
@@ -206,6 +206,10 @@ def main():
     endpoints = [e.strip() for e in args.endpoints.split(",") if e.strip() in ENDPOINTS]
     if not endpoints:
         print(f"No valid endpoints. Choose from: {list(ENDPOINTS.keys())}")
+        return 1
+
+    if not args.combine_only and not args.api_key:
+        print("ERROR: no API key. Set ALPHAVANTAGE_API_KEY env var or pass --api-key.")
         return 1
 
     out_dir = Path(args.out_dir)
