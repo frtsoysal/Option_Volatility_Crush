@@ -14,3 +14,19 @@ __pycache__/
 .DS_Store
 .ipynb_checkpoints/
 .claude/
+
+# Local cache and intermediate data — too large for git
+spy_strategy/data/cache/
+spy_strategy/data/models/
+unified_strategy/cache/
+unified_strategy/models/
+
+# Defensive patterns
+*.key
+*.pem
+*.pfx
+credentials*
+id_rsa*
+venv/
+.venv/
+*.pyc

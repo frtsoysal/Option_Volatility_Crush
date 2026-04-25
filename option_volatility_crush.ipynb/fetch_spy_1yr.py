@@ -208,10 +208,13 @@ def main():
         print(f"No valid endpoints. Choose from: {list(ENDPOINTS.keys())}")
         return 1
 
+<<<<<<< HEAD
     if not args.combine_only and not args.api_key:
         print("ERROR: no API key. Set ALPHAVANTAGE_API_KEY env var or pass --api-key.")
         return 1
 
+=======
+>>>>>>> joshua/main
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
