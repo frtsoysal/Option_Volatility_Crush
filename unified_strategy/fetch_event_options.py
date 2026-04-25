@@ -34,11 +34,14 @@ if str(VOL_CRUSH_UTILS_DIR) not in sys.path:
 
 import vol_crush_utils as vcu  # noqa: E402
 
+# Reuse the holiday-aware shifter from features.py (single source of truth).
+from .features import trading_day_offset
+
 
 def event_dates(announcement_date: pd.Timestamp) -> tuple[str, str]:
-    """Return (pre_date, post_date) as YYYY-MM-DD strings, 1 BD on either side."""
-    pre = vcu.get_trading_day_offset(str(announcement_date.date()), -1)
-    post = vcu.get_trading_day_offset(str(announcement_date.date()), 1)
+    """Return (pre_date, post_date) as YYYY-MM-DD strings — 1 US trading day each side, holiday-aware."""
+    pre = trading_day_offset(announcement_date, -1)
+    post = trading_day_offset(announcement_date, 1)
     return pre, post
 
 

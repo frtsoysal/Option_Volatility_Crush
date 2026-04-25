@@ -3,22 +3,50 @@ Feature engineering for the unified vol-crush pipeline.
 
 Three blocks per event row:
   A. Stock fundamentals (33 features)  — port of /ML/scripts/with_estimates/prepare_data.py
-  B. Stock options metrics (~10 features) — newly fetched + vol_crush_utils
+  B. Stock options metrics (~10 features) — derived from cached Alpha Vantage chains
   C. SPY market regime (30 features) — joined from spy_strategy/data/spy_daily_features.csv
-
-Block A is implemented here. Blocks B and C live alongside in 02_features.ipynb
-(the notebook orchestrates fetching + merging; this module supplies pure data
-transforms with no I/O side effects beyond reading the raw earnings CSVs).
 """
 
 from __future__ import annotations
 
+import json
+import sys
 from pathlib import Path
 from typing import Iterable
 
+import numpy as np
 import pandas as pd
 
-from . import ML_RAW_DIR, SP500_TICKERS_PATH, WINDOW_END, WINDOW_START
+from . import (
+    CACHE_DIR,
+    ML_RAW_DIR,
+    SPY_FEATURES_PATH,
+    SP500_TICKERS_PATH,
+    VOL_CRUSH_UTILS_DIR,
+    WINDOW_END,
+    WINDOW_START,
+)
+
+# vol_crush_utils lives in a directory ending in .ipynb; the dot breaks
+# normal package import semantics, so we add the dir to sys.path.
+if str(VOL_CRUSH_UTILS_DIR) not in sys.path:
+    sys.path.insert(0, str(VOL_CRUSH_UTILS_DIR))
+
+import vol_crush_utils as vcu  # noqa: E402
+
+# Holiday-aware US trading-day calendar. CustomBusinessDay with USFederalHolidayCalendar
+# correctly skips MLK Day, Presidents Day, Good Friday, Memorial Day, etc. — which
+# the plain pd.bdate_range() / pd.tseries.offsets.BDay used in vol_crush_utils does not.
+from pandas.tseries.holiday import USFederalHolidayCalendar
+from pandas.tseries.offsets import CustomBusinessDay
+
+_US_BD = CustomBusinessDay(calendar=USFederalHolidayCalendar())
+
+
+def trading_day_offset(date: str | pd.Timestamp, offset: int) -> str:
+    """Shift `date` by `offset` US trading days (skipping federal holidays)."""
+    dt = pd.Timestamp(date) + offset * _US_BD
+    return str(dt.date())
 
 # ---------------------------------------------------------------------------
 # Block A: Stock fundamentals
@@ -179,3 +207,257 @@ def assert_no_leakage(df: pd.DataFrame) -> None:
     bad = [c for c in LEAKAGE_COLS if c in df.columns]
     if bad:
         raise AssertionError(f"Leakage columns present in feature matrix: {bad}")
+
+
+# ---------------------------------------------------------------------------
+# Block B: Stock options metrics
+# Per event, compute ~10 features from the cached pre/post chain JSONs.
+# ---------------------------------------------------------------------------
+
+OPTION_FEATURE_COLS: list[str] = [
+    "stock_price_pre",
+    "stock_price_post",
+    "atm_strike_pre",
+    "atm_call_mid_pre",
+    "atm_put_mid_pre",
+    "straddle_price_pre",
+    "straddle_pct_pre",
+    "iv_call_pre",
+    "iv_put_pre",
+    "iv_avg_pre",
+    "iv_avg_post",
+    "iv_crush_pct",
+    "iv_term_slope",
+    "atm_open_interest_pre",
+    "atm_volume_pre",
+    "chain_pc_volume_ratio",
+    "dte_pre",  # days to expiration of the chosen ATM expiration
+]
+
+
+def _load_chain_json(path: Path) -> pd.DataFrame | None:
+    """Load one cached HISTORICAL_OPTIONS JSON into a DataFrame, or None if empty."""
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except Exception:
+        return None
+    rows = data.get("data") or []
+    if not rows:
+        return None
+    df = pd.DataFrame(rows)
+    df["fetch_date"] = path.stem
+    return df
+
+
+def compute_options_features(
+    ticker: str,
+    announcement_date: pd.Timestamp,
+    cache_dir: Path = CACHE_DIR,
+) -> dict[str, float]:
+    """
+    Compute Block-B options features for one event.
+
+    Returns a dict keyed by OPTION_FEATURE_COLS. Missing values become NaN.
+    """
+    out = {col: np.nan for col in OPTION_FEATURE_COLS}
+
+    pre_str = trading_day_offset(announcement_date, -1)
+    post_str = trading_day_offset(announcement_date, 1)
+
+    pre_path = cache_dir / ticker / f"{pre_str}.json"
+    post_path = cache_dir / ticker / f"{post_str}.json"
+
+    pre_chain = _load_chain_json(pre_path)
+    post_chain = _load_chain_json(post_path)
+
+    if pre_chain is None:
+        return out
+
+    # Estimate spot via put-call parity
+    spot_pre = vcu.estimate_stock_price_from_chain(pre_chain)
+    if spot_pre is None or spot_pre <= 0:
+        return out
+    out["stock_price_pre"] = float(spot_pre)
+
+    if post_chain is not None:
+        spot_post = vcu.estimate_stock_price_from_chain(post_chain)
+        if spot_post is not None and spot_post > 0:
+            out["stock_price_post"] = float(spot_post)
+
+    # ATM extraction (nearest-strike, near-expiration)
+    atm_pre = vcu.extract_atm_options(pre_chain, spot_pre)
+    if atm_pre is None:
+        return out
+
+    call_pre = atm_pre["call"]
+    put_pre = atm_pre["put"]
+    out["atm_strike_pre"] = float(call_pre["strike"])
+
+    straddle = vcu.compute_straddle_metrics(call_pre, put_pre, spot_pre)
+    out["atm_call_mid_pre"] = straddle["call_price"]
+    out["atm_put_mid_pre"] = straddle["put_price"]
+    out["straddle_price_pre"] = straddle["straddle_price"]
+    out["straddle_pct_pre"] = straddle["straddle_pct"]
+
+    # DTE for the chosen ATM expiration
+    if "expiration" in call_pre.index:
+        try:
+            exp = pd.to_datetime(call_pre["expiration"])
+            ref = pd.to_datetime(pre_str)
+            out["dte_pre"] = float((exp - ref).days)
+        except Exception:
+            pass
+
+    # IVs at pre — invert BS for both legs.
+    # Use the chain's reported implied_volatility column if present (Alpha Vantage
+    # already provides Greeks/IV in the chain), else invert via vol_crush_utils.
+    def _safe_iv(row, ot):
+        # 1) trust AV's own field if it exists and is numeric
+        for col in ("implied_volatility", "iv"):
+            v = row.get(col)
+            try:
+                v = float(v)
+                if 0 < v < 5.0:
+                    return v
+            except Exception:
+                continue
+        # 2) fallback: invert BS
+        if out["dte_pre"] is None or np.isnan(out["dte_pre"]):
+            return np.nan
+        T = float(out["dte_pre"]) / 365.0
+        if T <= 0:
+            return np.nan
+        try:
+            mid = vcu._mid_price(row)
+            return vcu.implied_vol(mid, spot_pre, float(row["strike"]), T, r=0.04, option_type=ot)
+        except Exception:
+            return np.nan
+
+    out["iv_call_pre"] = _safe_iv(call_pre, "call")
+    out["iv_put_pre"] = _safe_iv(put_pre, "put")
+    if pd.notna(out["iv_call_pre"]) and pd.notna(out["iv_put_pre"]):
+        out["iv_avg_pre"] = (out["iv_call_pre"] + out["iv_put_pre"]) / 2
+
+    # Post-event IV (for crush calculation)
+    if post_chain is not None:
+        spot_post_local = out.get("stock_price_post") or spot_pre
+        atm_post = vcu.extract_atm_options(post_chain, spot_post_local)
+        if atm_post is not None:
+            iv_call_post = _safe_iv(atm_post["call"], "call")
+            iv_put_post = _safe_iv(atm_post["put"], "put")
+            if pd.notna(iv_call_post) and pd.notna(iv_put_post):
+                out["iv_avg_post"] = (iv_call_post + iv_put_post) / 2
+
+    if pd.notna(out["iv_avg_pre"]) and pd.notna(out["iv_avg_post"]) and out["iv_avg_pre"] > 0:
+        out["iv_crush_pct"] = (out["iv_avg_pre"] - out["iv_avg_post"]) / out["iv_avg_pre"] * 100
+
+    # IV term structure: ATM IV at near expiry vs ~60-90 DTE
+    out["iv_term_slope"] = _term_structure_slope(pre_chain, spot_pre, near_dte=out["dte_pre"])
+
+    # Liquidity at the ATM strike
+    out["atm_open_interest_pre"] = pd.to_numeric(call_pre.get("open_interest", np.nan), errors="coerce")
+    out["atm_volume_pre"] = pd.to_numeric(call_pre.get("volume", np.nan), errors="coerce")
+
+    # Chain-level put/call volume ratio
+    out["chain_pc_volume_ratio"] = _chain_pc_ratio(pre_chain)
+
+    return out
+
+
+def _term_structure_slope(
+    chain: pd.DataFrame, spot: float, near_dte: float | None = None
+) -> float:
+    """Far-expiry ATM IV minus near-expiry ATM IV (positive = contango)."""
+    if "expiration" not in chain.columns or "implied_volatility" not in chain.columns:
+        return np.nan
+
+    df = chain.copy()
+    df["dte"] = (pd.to_datetime(df["expiration"], errors="coerce")
+                 - pd.to_datetime(df["fetch_date"], errors="coerce")).dt.days
+    df["iv"] = pd.to_numeric(df["implied_volatility"], errors="coerce")
+    df["strike"] = pd.to_numeric(df["strike"], errors="coerce")
+    df["dist"] = (df["strike"] - spot).abs()
+
+    if df.empty or df["iv"].isna().all():
+        return np.nan
+
+    # ATM only: take the strike closest to spot per (expiration, type) and average call+put
+    df["dist_rank"] = df.groupby(["expiration", "type"])["dist"].rank(method="first")
+    atm = df[df["dist_rank"] == 1]
+
+    iv_by_exp = atm.groupby(["expiration", "dte"])["iv"].mean().reset_index()
+    iv_by_exp = iv_by_exp[iv_by_exp["dte"] > 0].sort_values("dte")
+
+    if len(iv_by_exp) < 2:
+        return np.nan
+
+    near = iv_by_exp.iloc[0]
+    # Far = first expiry with DTE >= near + 30, else use the last expiry
+    far_candidates = iv_by_exp[iv_by_exp["dte"] >= near["dte"] + 30]
+    far = far_candidates.iloc[0] if not far_candidates.empty else iv_by_exp.iloc[-1]
+
+    return float(far["iv"] - near["iv"])
+
+
+def _chain_pc_ratio(chain: pd.DataFrame) -> float:
+    """Total put volume / total call volume across the whole chain."""
+    if "type" not in chain.columns or "volume" not in chain.columns:
+        return np.nan
+    df = chain.copy()
+    df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0)
+    types = df["type"].astype(str).str.lower()
+    call_v = df.loc[types == "call", "volume"].sum()
+    put_v = df.loc[types == "put", "volume"].sum()
+    return float(put_v / call_v) if call_v > 0 else np.nan
+
+
+def add_options_features(
+    events: pd.DataFrame,
+    cache_dir: Path = CACHE_DIR,
+    progress: bool = False,
+) -> pd.DataFrame:
+    """Compute Block-B features for every event row. Returns a new frame."""
+    rows = []
+    for i, ev in enumerate(events.itertuples(index=False), 1):
+        feats = compute_options_features(
+            str(ev.ticker), pd.Timestamp(ev.announcement_date), cache_dir
+        )
+        rows.append(feats)
+        if progress and i % 50 == 0:
+            print(f"  options features: {i}/{len(events)}")
+    out = pd.concat([events.reset_index(drop=True), pd.DataFrame(rows)], axis=1)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Block C: SPY market-regime context
+# ---------------------------------------------------------------------------
+
+def add_spy_context(
+    events: pd.DataFrame,
+    spy_path: Path = SPY_FEATURES_PATH,
+    date_col: str = "announcement_date",
+) -> pd.DataFrame:
+    """
+    Join Joshua's SPY daily features onto each event using merge_asof
+    (most recent SPY trading day STRICTLY BEFORE announcement). Robust
+    to US market holidays.
+    """
+    spy = pd.read_csv(spy_path, parse_dates=["date"])
+    spy = spy.sort_values("date").rename(columns={"date": "spy_join_date"})
+
+    # Prefix every SPY column except the join key for clarity in the merged frame
+    spy = spy.add_prefix("spy_").rename(columns={"spy_spy_join_date": "spy_join_date"})
+
+    events_sorted = events.sort_values(date_col).reset_index(drop=True)
+    merged = pd.merge_asof(
+        events_sorted,
+        spy,
+        left_on=date_col,
+        right_on="spy_join_date",
+        direction="backward",
+        allow_exact_matches=False,
+    )
+    return merged
