@@ -1,0 +1,20 @@
+{
+  "logreg": {
+    "threshold": 0.7900000000000005,
+    "pooled_val_n": 5318,
+    "pooled_val_selected": 111,
+    "pooled_val_total_pnl": 21218.574999999997
+  },
+  "lgbm": {
+    "threshold": 0.8300000000000005,
+    "pooled_val_n": 5318,
+    "pooled_val_selected": 75,
+    "pooled_val_total_pnl": 5742.125000000054
+  },
+  "xgb": {
+    "threshold": 0.7500000000000004,
+    "pooled_val_n": 5318,
+    "pooled_val_selected": 369,
+    "pooled_val_total_pnl": 35211.52500000005
+  }
+}

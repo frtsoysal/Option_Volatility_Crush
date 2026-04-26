@@ -175,6 +175,13 @@ def train_fold(
         sel["model"] = name
         sel["proba"] = proba_test[sel_mask]
 
+        # Also expose ALL test events with their probabilities so the caller
+        # can re-threshold with a CV-stable cutoff (walk-forward calibrated).
+        all_test = test_with_pnl.copy()
+        all_test["fold"] = fold.name
+        all_test["model"] = name
+        all_test["proba"] = proba_test
+
         fold_results["models"][name] = {
             "threshold": float(thr),
             "val_score": float(score),
@@ -184,7 +191,12 @@ def train_fold(
             "test_avg_pnl": float(sel["pnl_dollars"].mean()) if len(sel) else float("nan"),
             "test_sharpe": float(np.sqrt(252) * sel["pnl_dollars"].mean() / sel["pnl_dollars"].std())
                            if len(sel) > 1 and sel["pnl_dollars"].std() > 0 else float("nan"),
-            "trades": sel,  # the per-trade DataFrame, used to stitch concat track
+            "trades": sel,                # selected trades at fold-local threshold
+            "test_probas_all": all_test,  # all test events + probas (for re-threshold)
+            "val_probas": pd.DataFrame({
+                "fold": fold.name, "model": name,
+                "y": y_val.values, "proba": proba_val, "pnl_dollars": val_pnl,
+            }),
         }
 
     # always-short and vrp_only for this fold
@@ -293,6 +305,156 @@ def run_walk_forward(
     }
 
 
+def calibrate_with_walk_forward(
+    df: pd.DataFrame,
+    exit_mode: str = "hold_to_expiry",
+    folds: list[Fold] | None = None,
+    out_dir: Path | None = None,
+    min_trades_floor: int = 60,
+) -> dict:
+    """
+    Walk-forward CV with a CV-STABLE threshold per model.
+
+    The standard walk-forward run picks an independent threshold per fold
+    (each tuned on its own 6-month val window). With small val samples the
+    chosen thresholds bounce around (we observed 0.63 → 0.71). The strategy's
+    apparent profitability swings with the threshold, not the underlying
+    edge.
+
+    This calibration variant fixes that:
+      1. Run all folds, collect per-fold val predictions + per-event $P&L
+      2. POOL val data across folds → ~36 months of OOS validation evidence
+      3. Find ONE threshold per model that maximizes pooled val total $P&L
+         (with a `min_trades_floor` to prevent corner-of-a-fold solutions)
+      4. Apply that single threshold to every fold's test predictions
+      5. Concatenate per-fold tests into one chronological track record
+
+    Returns: {"per_fold": ..., "pooled_thresholds": dict, "summary": df,
+              "concat_trades": dict[name -> df]}
+    """
+    folds = folds or default_folds()
+    out_dir = (out_dir or (RESULTS_DIR / "walk_forward_calibrated" / exit_mode))
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Step 1+2: run each fold and collect val + test data
+    all_fold_results = []
+    val_pool: dict[str, list[pd.DataFrame]] = {}
+    test_pool: dict[str, list[pd.DataFrame]] = {}
+
+    print(f"=== Calibrated walk-forward, exit_mode={exit_mode} ===\n")
+    for fold in folds:
+        print(f"=== {fold.name}  train≤{fold.train_end.date()}  "
+              f"val→{fold.val_end.date()}  test→{fold.test_end.date()} ===")
+        result = train_fold(df, fold, exit_mode=exit_mode)
+        if "models" not in result:
+            print("  (skipped)")
+            continue
+
+        for name, m in result["models"].items():
+            if "error" in m or "val_probas" not in m:
+                continue
+            val_pool.setdefault(name, []).append(m["val_probas"])
+            test_pool.setdefault(name, []).append(m["test_probas_all"])
+            print(f"  {name:<14} fold-thr={m['threshold']:.2f}  val_n={len(m['val_probas']):>4}  test_n={len(m['test_probas_all']):>4}")
+        all_fold_results.append(result)
+        print()
+
+    # Step 3: pool val per model, find a robust threshold
+    print("=" * 60)
+    print(f"Pooled-val threshold (calibrated across all folds)")
+    print(f"min_trades floor on pooled val: {min_trades_floor}")
+    print("=" * 60)
+    pooled_thresholds: dict[str, dict] = {}
+    for name, frames in val_pool.items():
+        pool = pd.concat(frames, ignore_index=True)
+        thr, score = find_best_threshold(
+            y_true=pool["y"].values.astype(int),
+            y_score=pool["proba"].values,
+            pnl_dollars=pool["pnl_dollars"].values,
+            objective="pnl",
+            min_trades=min_trades_floor,
+            lo=0.30, hi=0.95,
+        )
+        n_pool_sel = int((pool["proba"].values >= thr).sum())
+        pooled_thresholds[name] = {
+            "threshold": float(thr),
+            "pooled_val_n": len(pool),
+            "pooled_val_selected": n_pool_sel,
+            "pooled_val_total_pnl": float(score),
+        }
+        print(f"  {name:<14} pooled_thr={thr:.2f}  "
+              f"selected {n_pool_sel}/{len(pool)} val events  "
+              f"pooled_total_$={score:>10,.0f}")
+
+    # Step 4: re-score each fold's test using the global threshold; concat
+    print()
+    print("=" * 60)
+    print("Concatenated test track using POOLED threshold")
+    print("=" * 60)
+    concat_trades: dict[str, pd.DataFrame] = {}
+    summary_rows = []
+    for name, frames in test_pool.items():
+        thr = pooled_thresholds[name]["threshold"]
+        all_tests = pd.concat(frames, ignore_index=True)
+        sel = all_tests[all_tests["proba"] >= thr].copy()
+        sel = sel.sort_values("announcement_date").reset_index(drop=True)
+        concat_trades[name] = sel
+
+        if len(sel):
+            eq = equity_curve(sel["pnl_dollars"], sel["announcement_date"])
+            m = metrics(eq, sel)
+            m["strategy"] = name
+            summary_rows.append(m)
+            sel.to_csv(out_dir / f"trades_{name}.csv", index=False)
+            eq.to_csv(out_dir / f"equity_{name}.csv", index=False)
+
+    # Always-short and vrp-only baselines (use the same union of test events)
+    if test_pool:
+        all_test_events = pd.concat(next(iter(test_pool.values())), ignore_index=True)
+        all_test_events = all_test_events.drop_duplicates(
+            subset=["ticker", "announcement_date"]
+        ).sort_values("announcement_date").reset_index(drop=True)
+
+        # always_short
+        eq = equity_curve(all_test_events["pnl_dollars"], all_test_events["announcement_date"])
+        m = metrics(eq, all_test_events); m["strategy"] = "always_short"
+        summary_rows.append(m)
+        all_test_events.to_csv(out_dir / "trades_always_short.csv", index=False)
+        eq.to_csv(out_dir / "equity_always_short.csv", index=False)
+        concat_trades["always_short"] = all_test_events
+
+        if "spy_vrp_30d" in all_test_events.columns:
+            vrp_sel = all_test_events[all_test_events["spy_vrp_30d"] > 0].copy()
+            if len(vrp_sel):
+                eq = equity_curve(vrp_sel["pnl_dollars"], vrp_sel["announcement_date"])
+                m = metrics(eq, vrp_sel); m["strategy"] = "vrp_only"
+                summary_rows.append(m)
+                vrp_sel.to_csv(out_dir / "trades_vrp_only.csv", index=False)
+                eq.to_csv(out_dir / "equity_vrp_only.csv", index=False)
+                concat_trades["vrp_only"] = vrp_sel
+
+    summary = pd.DataFrame(summary_rows)
+    cols_order = ["strategy", "n_trades", "win_rate", "avg_pnl_dollars",
+                  "total_pnl_dollars", "total_return_on_100k", "sharpe", "max_drawdown"]
+    summary = summary[[c for c in cols_order if c in summary.columns]]
+    summary = summary.sort_values("total_pnl_dollars", ascending=False).reset_index(drop=True)
+    summary.to_csv(out_dir / "walk_forward_calibrated_summary.csv", index=False)
+
+    # Persist pooled-threshold metadata
+    with open(out_dir / "pooled_thresholds.json", "w") as f:
+        json.dump(pooled_thresholds, f, indent=2)
+
+    print()
+    print(summary.to_string(index=False))
+
+    return {
+        "per_fold": all_fold_results,
+        "pooled_thresholds": pooled_thresholds,
+        "summary": summary,
+        "concat_trades": concat_trades,
+    }
+
+
 if __name__ == "__main__":
     # Allow running this module directly:
     #   python -m unified_strategy.walk_forward
@@ -302,9 +464,16 @@ if __name__ == "__main__":
     ap.add_argument("--features-csv", default=str(Path(__file__).parent / "data" / "02_event_features.csv"))
     ap.add_argument("--exit-mode", default="hold_to_expiry",
                     choices=["t_plus_1", "hold_to_expiry"])
+    ap.add_argument("--calibrated", action="store_true",
+                    help="Use pooled-val threshold instead of per-fold threshold")
+    ap.add_argument("--min-trades", type=int, default=60,
+                    help="Min trades on pooled val (only with --calibrated)")
     args = ap.parse_args()
 
     df = pd.read_csv(args.features_csv, parse_dates=["announcement_date"])
     df = df.dropna(subset=["crush_profitable", "stock_price_pre", "stock_price_post"]).reset_index(drop=True)
     print(f"Loaded {len(df):,} usable events")
-    run_walk_forward(df, exit_mode=args.exit_mode)
+    if args.calibrated:
+        calibrate_with_walk_forward(df, exit_mode=args.exit_mode, min_trades_floor=args.min_trades)
+    else:
+        run_walk_forward(df, exit_mode=args.exit_mode)
