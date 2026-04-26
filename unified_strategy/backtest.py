@@ -55,21 +55,32 @@ def per_event_pnl(
     df = events.copy()
 
     df["entry_premium"] = (df["atm_call_mid_pre"] + df["atm_put_mid_pre"]).clip(lower=0)
-    df["exit_intrinsic"] = (df["stock_price_post"] - df["atm_strike_pre"]).abs().clip(lower=0)
 
-    # If bid/ask weren't propagated to the events frame, approximate the half-spread
-    # as 10% of the entry premium. 5% holds for the top ~50 names (SPY/AAPL/MSFT
-    # on 30-DTE), but the bulk of SP500 is sub-$50B mid-caps where realistic
-    # short-straddle slippage is 8-12%. Using 10% gives a defensible blended
-    # number; for honest results compute per-event from raw chain bid/ask and
-    # populate `half_spread` upstream. (Review fix #2.)
+    # Exit pricing: prefer the REAL post-event mid (`exit_premium` from
+    # features.py — same strike + same expiration looked up in the post chain).
+    # Fall back to theoretical intrinsic only when the contract isn't quoted
+    # on the post date (rare: ~1-3% of events on early-window illiquid names).
+    intrinsic = (df["stock_price_post"] - df["atm_strike_pre"]).abs().clip(lower=0)
+    if "exit_premium" in df.columns:
+        df["exit_cost"] = df["exit_premium"].fillna(intrinsic)
+        df["exit_source"] = np.where(
+            df["exit_premium"].notna(), "real_post_mid", "intrinsic_fallback"
+        )
+    else:
+        df["exit_cost"] = intrinsic
+        df["exit_source"] = "intrinsic_fallback"
+
+    # Half-spread approximation — 10% of entry premium. Defensible blended
+    # number for SP500; would ideally come from raw chain bid/ask per event.
+    # Applied to BOTH legs of the round trip (entry + exit), so 0.10 here
+    # corresponds to 5% half-spread per side.
     if "half_spread" not in df.columns:
         df["half_spread"] = 0.10 * df["entry_premium"]
 
     df["commission"] = COMMISSION_PER_CONTRACT * LEGS * OPEN_AND_CLOSE * contract_count
 
     df["pnl_dollars"] = (
-        df["entry_premium"] - df["exit_intrinsic"] - df["half_spread"]
+        df["entry_premium"] - df["exit_cost"] - df["half_spread"]
     ) * 100 * contract_count - df["commission"]
 
     # Return normalized to underlying notional (= 100 × stock_price_pre per contract)
@@ -128,7 +139,13 @@ def metrics(equity: pd.DataFrame, trades: pd.DataFrame) -> dict:
     total_ret = (ending - starting) / starting
 
     n_days = (equity["date"].iloc[-1] - equity["date"].iloc[0]).days
-    cagr = (1 + total_ret) ** (365.25 / max(n_days, 1)) - 1
+    # CAGR is undefined when ending equity ≤ 0 (strategy lost more than
+    # starting capital). Surface that as NaN rather than crashing on a
+    # complex-number power.
+    if 1 + total_ret > 0:
+        cagr = (1 + total_ret) ** (365.25 / max(n_days, 1)) - 1
+    else:
+        cagr = float("nan")
 
     return {
         "n_trades": int(len(trades)),

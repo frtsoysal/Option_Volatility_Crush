@@ -218,10 +218,17 @@ OPTION_FEATURE_COLS: list[str] = [
     "stock_price_pre",
     "stock_price_post",
     "atm_strike_pre",
+    "atm_expiration_pre",  # the contract we sold, looked up again in post chain
     "atm_call_mid_pre",
     "atm_put_mid_pre",
     "straddle_price_pre",
     "straddle_pct_pre",
+    # Real post-event mids on the SAME (strike, expiration) we sold.
+    # Used by the backtest as the realistic close-out price (not theoretical
+    # intrinsic). NaN if the contract isn't quoted on the post date (rare).
+    "atm_call_mid_post",
+    "atm_put_mid_post",
+    "exit_premium",  # = atm_call_mid_post + atm_put_mid_post
     "iv_call_pre",
     "iv_put_pre",
     "iv_avg_pre",
@@ -294,6 +301,9 @@ def compute_options_features(
     call_pre = atm_pre["call"]
     put_pre = atm_pre["put"]
     out["atm_strike_pre"] = float(call_pre["strike"])
+    pre_strike = float(call_pre["strike"])
+    pre_expiration = str(call_pre["expiration"]) if "expiration" in call_pre.index else None
+    out["atm_expiration_pre"] = pre_expiration
 
     straddle = vcu.compute_straddle_metrics(call_pre, put_pre, spot_pre)
     out["atm_call_mid_pre"] = straddle["call_price"]
@@ -309,6 +319,29 @@ def compute_options_features(
             out["dte_pre"] = float((exp - ref).days)
         except Exception:
             pass
+
+    # ── Real post-event mids on the SAME contract we sold.
+    # Look up (pre_strike, pre_expiration) in the post chain. This is the
+    # realistic price you'd pay to close the short straddle the day after
+    # earnings — NOT theoretical intrinsic, NOT the post-chain ATM (because
+    # spot moved and a different strike would now be ATM). We need the
+    # SAME (strike, expiration) pair, otherwise we're closing a different
+    # contract than the one we opened.
+    if post_chain is not None and pre_expiration is not None:
+        post_match = post_chain[
+            (post_chain["expiration"] == pre_expiration)
+            & (pd.to_numeric(post_chain["strike"], errors="coerce") == pre_strike)
+        ]
+        if not post_match.empty:
+            types = post_match["type"].astype(str).str.lower()
+            calls = post_match[types == "call"]
+            puts = post_match[types == "put"]
+            if not calls.empty:
+                out["atm_call_mid_post"] = vcu._mid_price(calls.iloc[0])
+            if not puts.empty:
+                out["atm_put_mid_post"] = vcu._mid_price(puts.iloc[0])
+            if pd.notna(out["atm_call_mid_post"]) and pd.notna(out["atm_put_mid_post"]):
+                out["exit_premium"] = out["atm_call_mid_post"] + out["atm_put_mid_post"]
 
     # IVs at pre — invert BS for both legs.
     # Use the chain's reported implied_volatility column if present (Alpha Vantage

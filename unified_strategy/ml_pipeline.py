@@ -86,9 +86,16 @@ NON_FEATURE_COLS = {
     "stock_price_pre",
     "stock_price_post",
     "atm_strike_pre",
+    "atm_expiration_pre",
     "atm_call_mid_pre",
     "atm_put_mid_pre",
     "straddle_price_pre",
+    # Post-event option mids — KNOWN ONLY AFTER the event; including them
+    # as features would be catastrophic look-ahead leakage. They're computed
+    # for the backtest's exit pricing only.
+    "atm_call_mid_post",
+    "atm_put_mid_post",
+    "exit_premium",
     # NOTE: atm_open_interest_pre + atm_volume_pre are KEPT as features —
     # liquidity signals are valid pre-event predictors and not size-confounded
     # in any leakage sense. (Review fix #1.)
@@ -170,16 +177,47 @@ def build_xgb_pipeline(scale_pos_weight: float = 1.0, **kwargs) -> Pipeline:
 
 
 def find_best_threshold(
-    y_true: np.ndarray, y_score: np.ndarray, lo: float = 0.30, hi: float = 0.70
+    y_true: np.ndarray,
+    y_score: np.ndarray,
+    lo: float = 0.30,
+    hi: float = 0.90,
+    pnl_dollars: np.ndarray | None = None,
+    objective: str = "pnl",
+    min_trades: int = 30,
 ) -> tuple[float, float]:
-    """Sweep threshold in [lo, hi] step 0.01, return (best_threshold, best_mcc)."""
-    best_t, best = lo, -1.0
+    """
+    Pick a decision threshold by sweeping [lo, hi] in steps of 0.01.
+
+    Objective:
+        "pnl" — maximize TOTAL $P&L of the trades that pass the threshold.
+                Requires `pnl_dollars` to be passed. This is what we actually
+                care about for a trading strategy.
+        "mcc" — maximize binary classification quality (legacy, kept for
+                comparison and for runs without per-event P&L available).
+
+    `min_trades` rejects threshold candidates that admit fewer trades than
+    this floor — prevents picking a corner of the validation set with 4
+    lucky wins as "the best threshold". Set to 0 to disable.
+    """
+    best_t, best_score = lo, -np.inf
     for t in np.arange(lo, hi + 1e-9, 0.01):
-        y_hat = (y_score >= t).astype(int)
-        m = matthews_corrcoef(y_true, y_hat)
-        if m > best:
-            best, best_t = m, float(t)
-    return best_t, best
+        mask = y_score >= t
+        n = int(mask.sum())
+        if n < min_trades:
+            continue
+
+        if objective == "pnl":
+            if pnl_dollars is None:
+                raise ValueError("objective='pnl' requires pnl_dollars")
+            score = float(pnl_dollars[mask].sum())
+        else:
+            score = matthews_corrcoef(y_true, mask.astype(int))
+
+        if score > best_score:
+            best_score, best_t = score, float(t)
+
+    # If nothing met min_trades, fall back to lo (always-trade baseline).
+    return best_t, best_score
 
 
 def evaluate(y_true: np.ndarray, y_score: np.ndarray, threshold: float = 0.5) -> dict:
@@ -207,10 +245,11 @@ def train_one(
     y_val: pd.Series,
     X_test: pd.DataFrame,
     y_test: pd.Series,
+    val_pnl_dollars: np.ndarray | None = None,
     models_dir: Path = MODELS_DIR,
     results_dir: Path = RESULTS_DIR,
 ) -> dict:
-    """Fit, calibrate on val, threshold-tune on val, evaluate on test."""
+    """Fit, calibrate on val, threshold-tune on val ($P&L if available), evaluate on test."""
     models_dir.mkdir(parents=True, exist_ok=True)
     results_dir.mkdir(parents=True, exist_ok=True)
 
@@ -228,7 +267,17 @@ def train_one(
     cal_val = cal.predict_proba(X_val)[:, 1]
     cal_test = cal.predict_proba(X_test)[:, 1]
 
-    threshold, mcc_val = find_best_threshold(y_val.values, cal_val)
+    if val_pnl_dollars is not None:
+        threshold, score = find_best_threshold(
+            y_val.values, cal_val,
+            pnl_dollars=val_pnl_dollars, objective="pnl",
+        )
+        threshold_objective = "pnl"
+        threshold_score = float(score)
+    else:
+        threshold, score = find_best_threshold(y_val.values, cal_val, objective="mcc")
+        threshold_objective = "mcc"
+        threshold_score = float(score)
 
     metrics = {
         "name": name,
@@ -237,6 +286,8 @@ def train_one(
         "test_raw": evaluate(y_test.values, raw_test),
         "test_calibrated": evaluate(y_test.values, cal_test, threshold=threshold),
         "threshold": threshold,
+        "threshold_objective": threshold_objective,
+        "threshold_score_on_val": threshold_score,
     }
 
     joblib.dump(pipe, models_dir / f"{name}.pkl")
@@ -254,7 +305,13 @@ def train_all(
     """
     Train LR + LightGBM + XGBoost on the unified frame.
     Returns a metrics DataFrame and persists models + a metrics.json.
+
+    Threshold is tuned to maximize TOTAL VALIDATION $P&L (the trading
+    objective), not MCC. If per_event_pnl can't be computed (missing
+    columns), falls back to MCC-based threshold tuning.
     """
+    from .backtest import per_event_pnl  # local import to avoid cycle
+
     df = df.dropna(subset=[target]).copy()
     masks = temporal_split(df, date_col=date_col)
     train, val, test = df[masks["train"]], df[masks["val"]], df[masks["test"]]
@@ -268,30 +325,33 @@ def train_all(
     y_test = test[target].astype(int)
     print(f"Features: {len(feature_cols)}")
 
+    # Compute val per-trade $P&L for threshold tuning.
+    val_pnl_dollars = None
+    try:
+        val_with_pnl = per_event_pnl(val.copy())
+        val_pnl_dollars = val_with_pnl["pnl_dollars"].fillna(0).values
+        print(f"Threshold objective: max validation total $P&L  (mean per-trade ${val_pnl_dollars.mean():.0f})")
+    except Exception as e:
+        print(f"Threshold objective: max validation MCC  (per_event_pnl unavailable: {e})")
+
     results = []
+
+    common_kwargs = dict(
+        X_train=X_train, y_train=y_train,
+        X_val=X_val, y_val=y_val,
+        X_test=X_test, y_test=y_test,
+        val_pnl_dollars=val_pnl_dollars,
+        models_dir=models_dir, results_dir=results_dir,
+    )
 
     # 1. Logistic Regression
     print("\n[1/3] Logistic Regression")
-    results.append(
-        train_one(
-            "logreg",
-            build_lr_pipeline(),
-            X_train, y_train, X_val, y_val, X_test, y_test,
-            models_dir, results_dir,
-        )
-    )
+    results.append(train_one("logreg", build_lr_pipeline(), **common_kwargs))
 
     # 2. LightGBM
     if HAS_LGBM:
         print("\n[2/3] LightGBM")
-        results.append(
-            train_one(
-                "lgbm",
-                build_lgbm_pipeline(),
-                X_train, y_train, X_val, y_val, X_test, y_test,
-                models_dir, results_dir,
-            )
-        )
+        results.append(train_one("lgbm", build_lgbm_pipeline(), **common_kwargs))
     else:
         print("\n[2/3] LightGBM SKIPPED (not installed)")
 
@@ -299,14 +359,7 @@ def train_all(
     if HAS_XGB:
         print("\n[3/3] XGBoost")
         spw = float((y_train == 0).sum() / max((y_train == 1).sum(), 1))
-        results.append(
-            train_one(
-                "xgb",
-                build_xgb_pipeline(scale_pos_weight=spw),
-                X_train, y_train, X_val, y_val, X_test, y_test,
-                models_dir, results_dir,
-            )
-        )
+        results.append(train_one("xgb", build_xgb_pipeline(scale_pos_weight=spw), **common_kwargs))
     else:
         print("\n[3/3] XGBoost SKIPPED (not installed)")
 
