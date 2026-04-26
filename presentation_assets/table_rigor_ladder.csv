@@ -1,0 +1,6 @@
+Step,Headline,Verdict
+1. Naive intrinsic exit,"+$231/trade, Sharpe 6.74",Fantasy — assumes option decays to intrinsic instantly
+2. Realistic T+1 close,"−$144/trade, Sharpe −5.46",Disaster — pays back time value + round-trip slippage
+"3. Hold-to-expiry, single-split","+$184/trade, Sharpe 2.67",Lucky window — Fold 4 dominated
+4. Plain walk-forward (per-fold thr),"−$31/trade, Sharpe −0.65","Regime-dependent, threshold variance hides edge"
+5. Calibrated walk-forward (pooled-val thr),"+$108/trade, Sharpe 2.36, DD −4.2%",Deployable — robust across all 6 folds

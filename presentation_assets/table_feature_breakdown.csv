@@ -1,0 +1,4 @@
+Source,Count,ImportanceShare,Examples
+Stock fundamentals (your /ML pipeline),33,43.1%,"EPS estimates, analyst revisions, custom Elo system, lag-1 growth metrics"
+Options microstructure (newly fetched),11,19.6%,"ATM straddle %, IV pre/post, IV crush %, term-structure slope, OI/volume"
+SPY market regime (Joshua's pipeline),30,37.3%,"VIX, VRP 30d, IV rank, term slope, 25-delta skew, P/C ratio"

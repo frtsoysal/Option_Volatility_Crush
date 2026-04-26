@@ -1,0 +1,6 @@
+Strategy,Trades,WinRate,AvgPnL,TotalPnL,Sharpe,MaxDD
+always_short,4853,54.2%,−$84,−$408K,-2.86,−418%
+vrp_only (Joshua's),3541,53.6%,−$82,−$290K,-2.84,−304%
+ml_logreg @ 0.79,231,55.0%,−$7,−$1.5K,-0.22,−12%
+ml_xgb @ 0.75,367,52.6%,−$77,−$28K,-1.57,−39%
+ml_lgbm @ 0.83,78,61.5%,+$108,+$8.5K,2.36,−4.2%

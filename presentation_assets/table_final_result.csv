@@ -1,0 +1,11 @@
+Metric,Value
+ML model,LightGBM
+Exit mode,Hold to expiration
+Probability threshold,0.83 (pooled-val tuned)
+Trades over 4 years,78 (~20/year)
+Win rate,61.5%
+Avg P&L per trade,+$108
+Total P&L on $100K,"+$8,452"
+Sharpe ratio,2.36
+Max drawdown,−4.2%
+Calmar ratio,≈ 1.94
