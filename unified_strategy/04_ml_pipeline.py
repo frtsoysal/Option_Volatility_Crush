@@ -88,10 +88,12 @@ counts = feat_family.value_counts()
 fig, ax = plt.subplots(figsize=(8, 3))
 colors = {"STOCK (yours)": "#5cb85c", "SPY (Joshua)": "#f0ad4e",
           "OPTIONS (chains)": "#5bc0de", "OTHER": "#7d7d7d"}
-counts[list(colors.keys())].plot.barh(ax=ax, color=[colors[k] for k in colors])
+# Only plot families that actually appear in `counts` (most runs have no OTHER)
+present = [k for k in colors if k in counts.index]
+counts[present].plot.barh(ax=ax, color=[colors[k] for k in present])
 ax.set_xlabel("# features")
 ax.set_title(f"Feature count by source — {len(cols)} total")
-for i, v in enumerate(counts[list(colors.keys())].values):
+for i, v in enumerate(counts[present].values):
     ax.text(v + 0.3, i, str(v), va="center")
 plt.tight_layout()
 plt.show()
