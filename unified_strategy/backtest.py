@@ -58,10 +58,13 @@ def per_event_pnl(
     df["exit_intrinsic"] = (df["stock_price_post"] - df["atm_strike_pre"]).abs().clip(lower=0)
 
     # If bid/ask weren't propagated to the events frame, approximate the half-spread
-    # as 5% of the entry premium (a typical retail SPY/AAPL spread on liquid 30-DTE).
-    # Override per-event with `half_spread` if you compute it from raw chains.
+    # as 10% of the entry premium. 5% holds for the top ~50 names (SPY/AAPL/MSFT
+    # on 30-DTE), but the bulk of SP500 is sub-$50B mid-caps where realistic
+    # short-straddle slippage is 8-12%. Using 10% gives a defensible blended
+    # number; for honest results compute per-event from raw chain bid/ask and
+    # populate `half_spread` upstream. (Review fix #2.)
     if "half_spread" not in df.columns:
-        df["half_spread"] = 0.05 * df["entry_premium"]
+        df["half_spread"] = 0.10 * df["entry_premium"]
 
     df["commission"] = COMMISSION_PER_CONTRACT * LEGS * OPEN_AND_CLOSE * contract_count
 
@@ -77,38 +80,53 @@ def per_event_pnl(
 
 
 def equity_curve(
-    pnl_per_event: pd.Series,
+    pnl_dollars: pd.Series,
     dates: pd.Series,
-    starting_capital: float = 1.0,
+    starting_capital: float = 100_000.0,
 ) -> pd.DataFrame:
-    """Daily equity curve. pnl_per_event is fractional return on capital."""
-    df = pd.DataFrame({"date": pd.to_datetime(dates), "ret": pnl_per_event}).sort_values("date")
-    daily = df.groupby("date")["ret"].sum().reset_index()
-    daily["equity"] = starting_capital * (1.0 + daily["ret"]).cumprod()
+    """
+    Daily equity curve in dollars.
+
+    Convention: each trade is sized at 1 contract (the per_event_pnl `pnl_dollars`
+    column already accounts for that). Returns are SUMMED across trades on the
+    same day, then accumulated as a running dollar P&L on top of starting capital.
+    NOT compounded — compounding only makes sense when each trade redeploys the
+    full equity, which is not the case for fixed-contract-size short straddles.
+    """
+    df = pd.DataFrame({"date": pd.to_datetime(dates), "pnl": pnl_dollars}).sort_values("date")
+    daily = df.groupby("date")["pnl"].sum().reset_index()
+    daily["cum_pnl"] = daily["pnl"].cumsum()
+    daily["equity"] = starting_capital + daily["cum_pnl"]
     return daily
 
 
 def metrics(equity: pd.DataFrame, trades: pd.DataFrame) -> dict:
-    """Headline metrics for one strategy."""
+    """Headline metrics for one strategy. Equity is dollar-denominated."""
     if len(equity) == 0 or len(trades) == 0:
         return {"n_trades": 0}
 
-    daily_ret = equity["equity"].pct_change().dropna()
+    # Daily $ return on starting capital (not compound — fixed sizing per trade)
+    daily_ret = equity["pnl"] / equity["equity"].iloc[0]
     sharpe = (
         np.sqrt(252) * daily_ret.mean() / daily_ret.std()
         if daily_ret.std() > 0 else 0.0
     )
+
     rolling_max = equity["equity"].cummax()
     dd = (equity["equity"] - rolling_max) / rolling_max
     max_dd = float(dd.min())
 
-    pnls = trades["pnl_pct_notional"].dropna()
-    wins = pnls[pnls > 0]
-    losses = pnls[pnls <= 0]
+    pnls_dollars = trades["pnl_dollars"].dropna()
+    pnls_pct = trades["pnl_pct_notional"].dropna()
+    wins = pnls_dollars[pnls_dollars > 0]
+    losses = pnls_dollars[pnls_dollars <= 0]
     profit_factor = wins.sum() / abs(losses.sum()) if losses.sum() < 0 else np.inf
-    win_rate = float((pnls > 0).mean())
+    win_rate = float((pnls_dollars > 0).mean())
 
-    total_ret = float(equity["equity"].iloc[-1] / equity["equity"].iloc[0] - 1)
+    starting = float(equity["equity"].iloc[0])
+    ending = float(equity["equity"].iloc[-1])
+    total_ret = (ending - starting) / starting
+
     n_days = (equity["date"].iloc[-1] - equity["date"].iloc[0]).days
     cagr = (1 + total_ret) ** (365.25 / max(n_days, 1)) - 1
 
@@ -116,9 +134,11 @@ def metrics(equity: pd.DataFrame, trades: pd.DataFrame) -> dict:
         "n_trades": int(len(trades)),
         "win_rate": round(win_rate, 4),
         "profit_factor": round(float(profit_factor), 4) if np.isfinite(profit_factor) else float("inf"),
-        "avg_pnl_pct": round(float(pnls.mean()), 5),
-        "median_pnl_pct": round(float(pnls.median()), 5),
-        "total_return": round(total_ret, 4),
+        "avg_pnl_dollars": round(float(pnls_dollars.mean()), 2),
+        "median_pnl_dollars": round(float(pnls_dollars.median()), 2),
+        "avg_pnl_pct_notional": round(float(pnls_pct.mean()), 5),
+        "total_pnl_dollars": round(float(pnls_dollars.sum()), 2),
+        "total_return_on_100k": round(total_ret, 4),
         "cagr": round(float(cagr), 4),
         "sharpe": round(float(sharpe), 4),
         "max_drawdown": round(max_dd, 4),
@@ -150,7 +170,7 @@ def run_backtests(
 
     # 1. always_short — every event
     short_all = test.copy()
-    eq = equity_curve(short_all["pnl_pct_notional"], short_all["announcement_date"])
+    eq = equity_curve(short_all["pnl_dollars"], short_all["announcement_date"])
     eq.to_csv(out_dir / "equity_always_short.csv", index=False)
     short_all.to_csv(out_dir / "trades_always_short.csv", index=False)
     summaries.append({"strategy": "always_short", **metrics(eq, short_all)})
@@ -158,7 +178,7 @@ def run_backtests(
     # 2. vrp_only — Joshua's signal: VRP > 0 means IV > realized → sell vol
     if "spy_vrp_30d" in test.columns:
         vrp = test[test["spy_vrp_30d"] > 0].copy()
-        eq = equity_curve(vrp["pnl_pct_notional"], vrp["announcement_date"])
+        eq = equity_curve(vrp["pnl_dollars"], vrp["announcement_date"])
         eq.to_csv(out_dir / "equity_vrp_only.csv", index=False)
         vrp.to_csv(out_dir / "trades_vrp_only.csv", index=False)
         summaries.append({"strategy": "vrp_only", **metrics(eq, vrp)})
@@ -171,7 +191,7 @@ def run_backtests(
                 continue
             mask = proba >= threshold
             sel = test.loc[mask].copy()
-            eq = equity_curve(sel["pnl_pct_notional"], sel["announcement_date"])
+            eq = equity_curve(sel["pnl_dollars"], sel["announcement_date"])
             eq.to_csv(out_dir / f"equity_ml_{name}.csv", index=False)
             sel.to_csv(out_dir / f"trades_ml_{name}.csv", index=False)
             summaries.append({"strategy": f"ml_{name}", **metrics(eq, sel)})

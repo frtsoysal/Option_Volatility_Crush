@@ -80,14 +80,18 @@ NON_FEATURE_COLS = {
     "crush_profitable",
     "crush_pnl_pct",
     "actual_move_pct",
+    # Raw price levels are excluded — they vary wildly across stocks and would
+    # let the model learn ticker identity. The size-normalized straddle_pct_pre
+    # carries the relevant info.
     "stock_price_pre",
     "stock_price_post",
     "atm_strike_pre",
     "atm_call_mid_pre",
     "atm_put_mid_pre",
     "straddle_price_pre",
-    "atm_open_interest_pre",
-    "atm_volume_pre",
+    # NOTE: atm_open_interest_pre + atm_volume_pre are KEPT as features —
+    # liquidity signals are valid pre-event predictors and not size-confounded
+    # in any leakage sense. (Review fix #1.)
     *LEAKAGE_COLS,
 }
 

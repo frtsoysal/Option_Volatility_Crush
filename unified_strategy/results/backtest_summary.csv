@@ -1,7 +1,7 @@
-strategy,n_trades,win_rate,profit_factor,avg_pnl_pct,median_pnl_pct,total_return,cagr,sharpe,max_drawdown
-always_short,9,0.6667,1.0675,0.0012,0.01009,0.0167,0.1633,0.9878,-0.1285
-vrp_only,7,0.5714,0.4663,-0.01218,0.00696,-0.0736,-0.7353,-2.9383,-0.1285
-ml_logreg,0,,,,,,,,
-ml_lgbm,2,1.0,inf,0.04233,0.04233,0.0777,3.2141,0.0,0.0
-ml_xgb,0,,,,,,,,
-buy_hold_spy,1,,,,,0.0246,,3.1792,
+strategy,n_trades,win_rate,profit_factor,avg_pnl_dollars,median_pnl_dollars,avg_pnl_pct_notional,total_pnl_dollars,total_return_on_100k,cagr,sharpe,max_drawdown,total_return
+always_short,2195,0.6305,1.3201,97.57,102.9,0.00621,214155.5,2.1078,1.6378,3.0953,-0.2721,
+vrp_only,1309,0.6173,1.2364,78.56,88.7,0.00347,102837.3,1.0281,0.8892,2.3236,-0.3745,
+ml_logreg,1936,0.625,1.3118,95.46,96.9,0.006,184803.75,1.8175,1.4255,2.8544,-0.2643,
+ml_lgbm,1501,0.6562,1.6939,192.75,142.45,0.00998,289317.15,2.8538,2.1707,5.0101,-0.2572,
+ml_xgb,1357,0.6743,1.908,231.11,149.9,0.01136,313618.75,3.0918,2.3375,5.9037,-0.2291,
+buy_hold_spy,1,,,,,,,,,1.223,,0.2
