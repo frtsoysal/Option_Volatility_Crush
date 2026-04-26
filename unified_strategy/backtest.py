@@ -43,41 +43,61 @@ OPEN_AND_CLOSE = 2              # commissions paid on entry AND exit
 def per_event_pnl(
     events: pd.DataFrame,
     contract_count: int = 1,
+    exit_mode: str = "t_plus_1",
 ) -> pd.DataFrame:
     """
     Add per-event P&L columns to a labeled events frame.
 
-    Required columns:
-        atm_strike_pre, atm_call_mid_pre, atm_put_mid_pre,
-        stock_price_pre, stock_price_post,
-        atm_call_ask_pre? (optional)  atm_call_bid_pre?  same for put
+    exit_mode:
+        "t_plus_1"        Close the position 1 trading day after announcement
+                          using REAL post-event option mids. Pays back any
+                          remaining time value + 10% round-trip half-spread.
+                          Most defensible for retail with limited margin.
+        "hold_to_expiry"  Hold the short straddle to its actual expiration
+                          and settle at intrinsic. Exit slippage = 0 (the
+                          option just expires); friction is half-spread on
+                          ENTRY only (5%, since the round trip becomes a
+                          one-way trade). Requires `exit_intrinsic_at_expiry`
+                          column populated by features.add_expiry_intrinsic.
     """
     df = events.copy()
 
     df["entry_premium"] = (df["atm_call_mid_pre"] + df["atm_put_mid_pre"]).clip(lower=0)
 
-    # Exit pricing: prefer the REAL post-event mid (`exit_premium` from
-    # features.py — same strike + same expiration looked up in the post chain).
-    # Fall back to theoretical intrinsic only when the contract isn't quoted
-    # on the post date (rare: ~1-3% of events on early-window illiquid names).
-    intrinsic = (df["stock_price_post"] - df["atm_strike_pre"]).abs().clip(lower=0)
-    if "exit_premium" in df.columns:
-        df["exit_cost"] = df["exit_premium"].fillna(intrinsic)
+    if exit_mode == "hold_to_expiry":
+        if "exit_intrinsic_at_expiry" not in df.columns:
+            raise ValueError(
+                "exit_mode='hold_to_expiry' requires features.add_expiry_intrinsic to "
+                "have populated `exit_intrinsic_at_expiry` (and `expiry_close`)."
+            )
+        # Hold to expiry: the option's value at exit IS the intrinsic. No exit
+        # mid, no exit half-spread. Friction is half-spread on the entry side
+        # only — represents the bid you crossed selling the straddle.
+        intrinsic_t1 = (df["stock_price_post"] - df["atm_strike_pre"]).abs().clip(lower=0)
+        df["exit_cost"] = df["exit_intrinsic_at_expiry"].fillna(intrinsic_t1)
         df["exit_source"] = np.where(
-            df["exit_premium"].notna(), "real_post_mid", "intrinsic_fallback"
+            df["exit_intrinsic_at_expiry"].notna(),
+            "expiry_intrinsic",
+            "t1_intrinsic_fallback",
         )
+        if "half_spread" not in df.columns:
+            df["half_spread"] = 0.05 * df["entry_premium"]  # one-side bid-ask
+        # Commission: open both legs + assignment fee for the ITM leg (~$0.65)
+        df["commission"] = COMMISSION_PER_CONTRACT * LEGS * 1 * contract_count + 0.65
     else:
-        df["exit_cost"] = intrinsic
-        df["exit_source"] = "intrinsic_fallback"
-
-    # Half-spread approximation — 10% of entry premium. Defensible blended
-    # number for SP500; would ideally come from raw chain bid/ask per event.
-    # Applied to BOTH legs of the round trip (entry + exit), so 0.10 here
-    # corresponds to 5% half-spread per side.
-    if "half_spread" not in df.columns:
-        df["half_spread"] = 0.10 * df["entry_premium"]
-
-    df["commission"] = COMMISSION_PER_CONTRACT * LEGS * OPEN_AND_CLOSE * contract_count
+        # Default: close at T+1 with real post-event mids when available
+        intrinsic_t1 = (df["stock_price_post"] - df["atm_strike_pre"]).abs().clip(lower=0)
+        if "exit_premium" in df.columns:
+            df["exit_cost"] = df["exit_premium"].fillna(intrinsic_t1)
+            df["exit_source"] = np.where(
+                df["exit_premium"].notna(), "real_post_mid", "intrinsic_fallback"
+            )
+        else:
+            df["exit_cost"] = intrinsic_t1
+            df["exit_source"] = "intrinsic_fallback"
+        if "half_spread" not in df.columns:
+            df["half_spread"] = 0.10 * df["entry_premium"]  # round-trip
+        df["commission"] = COMMISSION_PER_CONTRACT * LEGS * OPEN_AND_CLOSE * contract_count
 
     df["pnl_dollars"] = (
         df["entry_premium"] - df["exit_cost"] - df["half_spread"]
@@ -167,6 +187,7 @@ def run_backtests(
     predictions: dict[str, np.ndarray] | None = None,
     threshold: float = 0.5,
     out_dir: Path = RESULTS_DIR,
+    exit_mode: str = "t_plus_1",
 ) -> pd.DataFrame:
     """
     Compute P&L curves for the four strategies on the test split.
@@ -180,8 +201,9 @@ def run_backtests(
     masks = temporal_split(events, date_col="announcement_date")
     test = events[masks["test"]].copy().reset_index(drop=True)
     print(f"Test events: {len(test)}  (date range {test['announcement_date'].min().date()} → {test['announcement_date'].max().date()})")
+    print(f"Exit mode:   {exit_mode}")
 
-    test = per_event_pnl(test)
+    test = per_event_pnl(test, exit_mode=exit_mode)
 
     summaries = []
 

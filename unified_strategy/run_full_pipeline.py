@@ -26,6 +26,7 @@ if str(HERE.parent) not in sys.path:
 
 from unified_strategy import CACHE_DIR, RESULTS_DIR
 from unified_strategy.features import (
+    add_expiry_intrinsic,
     add_options_features,
     add_spy_context,
     load_all_stock_events,
@@ -59,7 +60,12 @@ def main():
     print(f"\nLabels: crush_profitable + crush_pnl_pct  in {time.time() - t0:.1f}s")
 
     t0 = time.time()
-    final = add_spy_context(labeled)
+    with_expiry = add_expiry_intrinsic(labeled)
+    n_expiry = with_expiry["expiry_close"].notna().sum()
+    print(f"Block B+ (expiry intrinsic): {n_expiry:,}/{len(with_expiry):,} events have expiry_close  in {time.time() - t0:.1f}s")
+
+    t0 = time.time()
+    final = add_spy_context(with_expiry)
     print(f"Block C (SPY context): final {final.shape[1]} cols  in {time.time() - t0:.1f}s")
 
     # Drop rows where we don't have everything we need to label or train
@@ -80,15 +86,15 @@ def main():
 
     print()
     print("=" * 60)
-    print("Phase 3.2b — Train LR + LightGBM + XGBoost")
+    print("Phase 3.2b — Train LR + LightGBM + XGBoost (threshold for hold_to_expiry)")
     print("=" * 60)
-    summary = train_all(usable)
+    summary = train_all(usable, exit_mode="hold_to_expiry")
     print()
     print(summary.to_string(index=False))
 
     print()
     print("=" * 60)
-    print("Phase 3.2c — Backtest")
+    print("Phase 3.2c — Backtest both exit modes")
     print("=" * 60)
     masks = temporal_split(usable, date_col="announcement_date")
     test = usable[masks["test"]].reset_index(drop=True)
@@ -107,15 +113,36 @@ def main():
         predictions[name] = proba
 
     if not summary.empty:
-        # Use LightGBM threshold if present, else first model's
-        if "lgbm" in summary["model"].values:
-            threshold = float(summary.loc[summary["model"] == "lgbm", "threshold"].iloc[0])
-        else:
-            threshold = float(summary.iloc[0]["threshold"])
+        threshold = float(summary.loc[summary["model"] == "lgbm", "threshold"].iloc[0]) \
+                    if "lgbm" in summary["model"].values \
+                    else float(summary.iloc[0]["threshold"])
 
-    bt = run_backtests(usable, predictions=predictions, threshold=threshold or 0.5)
-    print()
-    print(bt.to_string(index=False))
+    print("\n--- HOLD TO EXPIRY (no exit half-spread, intrinsic at expiration) ---")
+    bt_hte_dir = RESULTS_DIR / "hold_to_expiry"
+    bt_hte_dir.mkdir(parents=True, exist_ok=True)
+    bt_hte = run_backtests(
+        usable, predictions=predictions, threshold=threshold or 0.5,
+        out_dir=bt_hte_dir, exit_mode="hold_to_expiry",
+    )
+    print(bt_hte.to_string(index=False))
+
+    print("\n--- T+1 CLOSE (real post mids, 10% round-trip half-spread) ---")
+    bt_t1_dir = RESULTS_DIR / "t_plus_1"
+    bt_t1_dir.mkdir(parents=True, exist_ok=True)
+    bt_t1 = run_backtests(
+        usable, predictions=predictions, threshold=threshold or 0.5,
+        out_dir=bt_t1_dir, exit_mode="t_plus_1",
+    )
+    print(bt_t1.to_string(index=False))
+
+    # Side-by-side delta on the headline column
+    print("\n--- DELTA: hold_to_expiry vs t_plus_1 ---")
+    merged = bt_hte.merge(bt_t1, on="strategy", suffixes=("_hte", "_t1"))[
+        ["strategy", "n_trades_hte", "win_rate_hte", "avg_pnl_dollars_hte",
+         "total_pnl_dollars_hte", "sharpe_hte",
+         "win_rate_t1", "avg_pnl_dollars_t1", "total_pnl_dollars_t1", "sharpe_t1"]
+    ]
+    print(merged.to_string(index=False))
 
     print()
     print("=" * 60)

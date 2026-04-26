@@ -96,6 +96,10 @@ NON_FEATURE_COLS = {
     "atm_call_mid_post",
     "atm_put_mid_post",
     "exit_premium",
+    # Hold-to-expiry exit — also post-event (the close on a future date).
+    # Excluded from features for the same reason.
+    "expiry_close",
+    "exit_intrinsic_at_expiry",
     # NOTE: atm_open_interest_pre + atm_volume_pre are KEPT as features —
     # liquidity signals are valid pre-event predictors and not size-confounded
     # in any leakage sense. (Review fix #1.)
@@ -301,14 +305,15 @@ def train_all(
     date_col: str = "announcement_date",
     models_dir: Path = MODELS_DIR,
     results_dir: Path = RESULTS_DIR,
+    exit_mode: str = "t_plus_1",
 ) -> pd.DataFrame:
     """
     Train LR + LightGBM + XGBoost on the unified frame.
     Returns a metrics DataFrame and persists models + a metrics.json.
 
-    Threshold is tuned to maximize TOTAL VALIDATION $P&L (the trading
-    objective), not MCC. If per_event_pnl can't be computed (missing
-    columns), falls back to MCC-based threshold tuning.
+    Threshold is tuned to maximize TOTAL VALIDATION $P&L for the chosen
+    `exit_mode` (t_plus_1 vs hold_to_expiry). The trading mode and the
+    threshold-tuning mode should match.
     """
     from .backtest import per_event_pnl  # local import to avoid cycle
 
@@ -324,11 +329,12 @@ def train_all(
     y_val = val[target].astype(int)
     y_test = test[target].astype(int)
     print(f"Features: {len(feature_cols)}")
+    print(f"Threshold tuning exit_mode: {exit_mode}")
 
-    # Compute val per-trade $P&L for threshold tuning.
+    # Compute val per-trade $P&L for threshold tuning under the chosen mode.
     val_pnl_dollars = None
     try:
-        val_with_pnl = per_event_pnl(val.copy())
+        val_with_pnl = per_event_pnl(val.copy(), exit_mode=exit_mode)
         val_pnl_dollars = val_with_pnl["pnl_dollars"].fillna(0).values
         print(f"Threshold objective: max validation total $P&L  (mean per-trade ${val_pnl_dollars.mean():.0f})")
     except Exception as e:

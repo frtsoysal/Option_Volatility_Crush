@@ -229,6 +229,12 @@ OPTION_FEATURE_COLS: list[str] = [
     "atm_call_mid_post",
     "atm_put_mid_post",
     "exit_premium",  # = atm_call_mid_post + atm_put_mid_post
+    # Hold-to-expiration close: the underlying's close on the contract's
+    # expiration date, joined from cached TIME_SERIES_DAILY. Used by the
+    # backtest's hold_to_expiry mode — at expiration the option's value
+    # is purely intrinsic, so we don't pay back any time value.
+    "expiry_close",
+    "exit_intrinsic_at_expiry",  # = max(0, |expiry_close - atm_strike_pre|)
     "iv_call_pre",
     "iv_put_pre",
     "iv_avg_pre",
@@ -461,6 +467,60 @@ def add_options_features(
         if progress and i % 50 == 0:
             print(f"  options features: {i}/{len(events)}")
     out = pd.concat([events.reset_index(drop=True), pd.DataFrame(rows)], axis=1)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Block B+: hold-to-expiration close prices
+# Joined separately because daily prices come from a different cache
+# (TIME_SERIES_DAILY per ticker) than the per-event option chains.
+# ---------------------------------------------------------------------------
+
+def add_expiry_intrinsic(
+    events: pd.DataFrame,
+    daily_cache_dir: Path | None = None,
+) -> pd.DataFrame:
+    """
+    Join the underlying's close on each contract's expiration date and
+    compute exit_intrinsic_at_expiry for the hold-to-expiry backtest.
+
+    Requires: events must have `ticker`, `atm_strike_pre`, `atm_expiration_pre`.
+    Reads from `unified_strategy/cache/daily_prices/{TICKER}.json` (one
+    Alpha Vantage TIME_SERIES_DAILY response per ticker).
+
+    NaN where:
+      - daily price file missing
+      - expiration date is missing or post-event (after our data window)
+      - market was closed on the expiration date and no nearby trading day
+    """
+    from .fetch_daily_prices import DAILY_CACHE_DIR, load_daily_prices
+
+    if daily_cache_dir is None:
+        daily_cache_dir = DAILY_CACHE_DIR
+
+    out = events.copy()
+    expiry_close = []
+    for ticker, exp in zip(out["ticker"], out["atm_expiration_pre"]):
+        if pd.isna(exp) or pd.isna(ticker):
+            expiry_close.append(np.nan)
+            continue
+        prices = load_daily_prices(str(ticker), daily_cache_dir)
+        if prices is None or prices.empty:
+            expiry_close.append(np.nan)
+            continue
+        exp_dt = pd.Timestamp(exp).normalize()
+        # Try exact match first; if expiration is on a non-trading day
+        # (rare — most options expire on a Friday) take the prior trading day.
+        if exp_dt in prices.index:
+            expiry_close.append(float(prices.loc[exp_dt]))
+        else:
+            prior = prices.index[prices.index <= exp_dt]
+            expiry_close.append(float(prices.loc[prior[-1]]) if len(prior) else np.nan)
+
+    out["expiry_close"] = expiry_close
+    out["exit_intrinsic_at_expiry"] = (
+        out["expiry_close"] - out["atm_strike_pre"]
+    ).abs().clip(lower=0)
     return out
 
 

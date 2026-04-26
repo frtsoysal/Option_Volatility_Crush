@@ -59,7 +59,7 @@
     },
     "threshold": 0.7100000000000004,
     "threshold_objective": "pnl",
-    "threshold_score_on_val": -4640.35
+    "threshold_score_on_val": 10093.875000000018
   },
   {
     "name": "lgbm",
@@ -121,7 +121,7 @@
     },
     "threshold": 0.7300000000000004,
     "threshold_objective": "pnl",
-    "threshold_score_on_val": 2386.300000000003
+    "threshold_score_on_val": -4520.099999999995
   },
   {
     "name": "xgb",
@@ -183,6 +183,6 @@
     },
     "threshold": 0.7400000000000004,
     "threshold_objective": "pnl",
-    "threshold_score_on_val": -4599.049999999999
+    "threshold_score_on_val": -3261.0249999999983
   }
 ]
