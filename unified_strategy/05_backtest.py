@@ -119,8 +119,8 @@ for name, path in strategy_files.items():
     ax.plot(eq["date"], eq["equity"], label=name, linewidth=1.6)
 
 ax.set_xlabel("date")
-ax.set_ylabel("equity ($)")
-ax.set_title("Test-window equity curves — $100K starting capital")
+ax.set_ylabel(r"equity (\$)")
+ax.set_title(r"Test-window equity curves — \$100K starting capital")
 ax.legend(loc="upper left")
 ax.grid(alpha=0.3)
 plt.tight_layout()
@@ -146,7 +146,7 @@ for ax, name in zip(axes, ["always_short", "ml_lgbm", "ml_xgb"]):
     mean_pnl = trades["pnl_dollars"].mean()
     ax.axvline(mean_pnl, color="darkred", linewidth=1.5,
                label=f"avg ${mean_pnl:.0f}")
-    ax.set_xlabel("pnl per trade ($)")
+    ax.set_xlabel(r"pnl per trade (\$)")
     ax.set_title(f"{name}  (n={len(trades)}, win={100*(trades['pnl_dollars']>0).mean():.1f}%)")
     ax.legend()
 axes[0].set_ylabel("# trades")

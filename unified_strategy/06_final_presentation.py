@@ -247,8 +247,8 @@ for name, path in strategy_files.items():
         continue
     ax.plot(eq["date"], eq["equity"], label=name, linewidth=1.6)
 ax.set_xlabel("date")
-ax.set_ylabel("equity ($)")
-ax.set_title("Test-window equity curves — $100K starting capital, 10% half-spread, $2.60 commission")
+ax.set_ylabel(r"equity (\$)")
+ax.set_title(r"Test-window equity curves — \$100K starting capital, 10% half-spread, \$2.60 commission")
 ax.legend(loc="upper left")
 ax.grid(alpha=0.3)
 plt.tight_layout()
